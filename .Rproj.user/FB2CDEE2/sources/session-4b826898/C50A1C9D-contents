@@ -182,7 +182,7 @@ if (keep_largest_blob) {
 ```{r}
 
 res <- extract_centergrown_colors(
-  "/Users/hputnam/MyProjects/Color_Extract/data/IMG_4355.JPG",
+  "/Users/hputnam/MyProjects/Color_Extract/data/IMG_4398.JPG",
   use_lab = TRUE,
   center_patch = 21,
   tol_quantile = 0.90,
@@ -193,8 +193,29 @@ res$mean_RGB_0_1
 res$mean_HSV_0_1
 res$mean_CMYK_0_1
 
+# Flatten results into a single row data frame
+color_df <- data.frame(
+  R = res$mean_RGB_0_1["R"],
+  G = res$mean_RGB_0_1["G"],
+  B = res$mean_RGB_0_1["B"],
+  H = res$mean_HSV_0_1["H"] * 360,  # convert Hue from [0,1] to degrees
+  S = res$mean_HSV_0_1["S"],
+  V = res$mean_HSV_0_1["V"],
+  C = res$mean_CMYK_0_1["C"],
+  M = res$mean_CMYK_0_1["M"],
+  Y = res$mean_CMYK_0_1["Y"],
+  K = res$mean_CMYK_0_1["K"],
+  roi_pixels = res$roi_pixels
+)
 
-path <- "/Users/hputnam/MyProjects/Color_Extract/data/IMG_4355.JPG"
+# Save to CSV
+write.csv(color_df, "output/roi_color_values.csv", row.names = FALSE)
+
+# Check what got saved
+color_df
+
+
+path <- "/Users/hputnam/MyProjects/Color_Extract/data/IMG_4398.JPG"
 
 pdf("/Users/hputnam/MyProjects/Color_Extract/output/roi_overlay.pdf", width = 10, height = 7.5)  # size in inches
 plot(load.image(path), axes = FALSE)
