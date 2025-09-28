@@ -1,0 +1,204 @@
+---
+title: "color_extract"
+author: "HM Putnam"
+date: "2025-09-28"
+output: html_document
+---
+
+edge detection
+```{r}
+#"/Users/hputnam/MyProjects/Color_Extract/data/IMG_4263_MU.JPG"
+
+library(imager)
+library(dplyr)
+
+# --- helpers -------------------------------------------------------------
+rgb_to_cmyk <- function(r, g, b) {
+  k <- 1 - pmax(r, g, b)
+  denom <- pmax(1 - k, .Machine$double.eps)
+  c <- (1 - r - k) / denom
+  m <- (1 - g - k) / denom
+  y <- (1 - b - k) / denom
+  cbind(C = c, M = m, Y = y, K = k)
+}
+
+# Convert a 3-channel cimg (sRGB in 0..1) to Lab and return the 3 channels as a list
+rgb_cimg_to_lab_channels <- function(rgb) {
+  W <- width(rgb); H <- height(rgb)
+  ch <- imsplit(rgb, "c")        # list of 3 single-channel cim g (R,G,B), all same dims
+  R <- as.numeric(ch[[1]]); G <- as.numeric(ch[[2]]); B <- as.numeric(ch[[3]])
+  lab <- grDevices::convertColor(cbind(R,G,B), from = "sRGB", to = "Lab")
+  # Split back into three vectors and reshape each with the same x,y
+  L <- as.cimg(lab[,1], x = W, y = H, z = 1, cc = 1)
+  a <- as.cimg(lab[,2], x = W, y = H, z = 1, cc = 1)
+  b <- as.cimg(lab[,3], x = W, y = H, z = 1, cc = 1)
+  list(L = L, a = a, b = b)
+}
+
+compute_stats <- function(rgb, mask) {
+  ch <- imsplit(rgb, "c")
+  m  <- as.logical(mask)
+
+  r_vals <- as.numeric(ch[[1]])[m]
+  g_vals <- as.numeric(ch[[2]])[m]
+  b_vals <- as.numeric(ch[[3]])[m]
+  if (!length(r_vals)) stop("ROI mask empty; adjust parameters.")
+
+  # Mean RGB in [0,1]
+  rgb_mean <- c(R = mean(r_vals), G = mean(g_vals), B = mean(b_vals))
+
+  # HSV via rgb2hsv (expects a 3xN matrix with rows R,G,B)
+  mtx <- matrix(c(rgb_mean["R"], rgb_mean["G"], rgb_mean["B"]),
+                nrow = 3, ncol = 1, byrow = FALSE)
+  hsv_vec <- grDevices::rgb2hsv(mtx)[, 1]  # c(H,S,V) with H in [0,1]
+  names(hsv_vec) <- c("H", "S", "V")
+
+  # CMYK (device-independent formula), average over pixels
+  rgb_to_cmyk <- function(r, g, b) {
+    k <- 1 - pmax(r, g, b)
+    denom <- pmax(1 - k, .Machine$double.eps)
+    c <- (1 - r - k) / denom
+    m <- (1 - g - k) / denom
+    y <- (1 - b - k) / denom
+    cbind(C = c, M = m, Y = y, K = k)
+  }
+  cmyk_mean <- colMeans(rgb_to_cmyk(r_vals, g_vals, b_vals))
+
+  list(
+    mean_RGB_0_1  = rgb_mean,
+    mean_HSV_0_1  = hsv_vec,       # H∈[0,1] (×360 for degrees)
+    mean_CMYK_0_1 = cmyk_mean,
+    roi_pixels    = length(r_vals)
+  )
+}
+
+
+# --- main ---------------------------------------------------------------
+extract_centergrown_colors <- function(path,
+                                       use_lab = TRUE,
+                                       center_patch = 21,      # odd size in px
+                                       tol_quantile = 0.90,    # looser = bigger region
+                                       keep_largest_blob = TRUE,
+                                       verbose = TRUE) {
+  vcat <- function(...) if (verbose) cat(...,"\n")
+
+  vcat("Loading image...")
+  img <- load.image(path)
+  if (spectrum(img) < 3) stop("Image must be RGB/RGBA.")
+  rgb <- if (spectrum(img) == 4) imsub(img, cc %in% 1:3) else img
+  W <- width(rgb); H <- height(rgb)
+  vcat("Size:", W, "x", H)
+
+  # denoise a bit
+  rgb_smooth <- isoblur(rgb, 1)
+
+  # Choose working color space and get per-channel cim g’s via imsplit()
+  vcat("Preparing color space...")
+  if (use_lab) {
+    lab <- rgb_cimg_to_lab_channels(rgb_smooth)  # list L,a,b (each cimg, same dims)
+    ch1 <- lab$L; ch2 <- lab$a; ch3 <- lab$b
+  } else {
+    ch <- imsplit(rgb_smooth, "c")               # list R,G,B (each same dims)
+    ch1 <- ch[[1]]; ch2 <- ch[[2]]; ch3 <- ch[[3]]
+  }
+
+  # Seed patch around the exact center
+  cx <- floor(W/2); cy <- floor(H/2)
+  half <- floor(center_patch/2)
+  x1 <- max(1, cx - half); x2 <- min(W, cx + half)
+  y1 <- max(1, cy - half); y2 <- min(H, cy + half)
+
+  seed1 <- imsub(ch1, x %in% x1:x2, y %in% y1:y2)
+  seed2 <- imsub(ch2, x %in% x1:x2, y %in% y1:y2)
+  seed3 <- imsub(ch3, x %in% x1:x2, y %in% y1:y2)
+
+  s1 <- mean(as.numeric(seed1))
+  s2 <- mean(as.numeric(seed2))
+  s3 <- mean(as.numeric(seed3))
+
+  # Per-pixel Euclidean distance in the chosen space
+  # (all three channels are cimg with identical dims, so these ops conform)
+  d1 <- ch1 - s1
+  d2 <- ch2 - s2
+  d3 <- ch3 - s3
+  dist <- sqrt(d1*d1 + d2*d2 + d3*d3)
+
+  # Adaptive threshold from distances inside the seed patch
+  seed_dist <- sqrt((seed1 - s1)*(seed1 - s1) + (seed2 - s2)*(seed2 - s2) + (seed3 - s3)*(seed3 - s3))
+  thr <- as.numeric(quantile(as.numeric(seed_dist), tol_quantile, na.rm = TRUE))
+  vcat(sprintf("Distance threshold (q=%.2f): %.5f", tol_quantile, thr))
+
+  mask <- (dist <= thr) * 1  # single-channel cimg (0/1)
+
+  # Optionally keep the largest blob near center
+# Optionally keep the largest blob near center (name-agnostic for the label column)
+if (keep_largest_blob) {
+  labm <- label(mask, high_connectivity = TRUE)
+
+  df <- as.data.frame(labm)
+
+  # Figure out which column holds the label ids (it isn’t always "value")
+  label_col <- setdiff(names(df), c("x","y","cc","z","frame"))
+  if (length(label_col) != 1)
+    stop("Couldn't identify label column in label() dataframe. Found: ",
+         paste(setdiff(names(df), c("x","y","cc","z","frame")), collapse=", "))
+
+  names(df)[names(df) == label_col] <- "lbl"
+
+  df <- df %>%
+    dplyr::filter(lbl != 0) %>%
+    dplyr::group_by(lbl) %>%
+    dplyr::summarise(
+      area   = dplyr::n(),
+      x_mean = mean(x),
+      y_mean = mean(y),
+      .groups = "drop"
+    ) %>%
+    dplyr::mutate(dist_center = sqrt((x_mean - W/2)^2 + (y_mean - H/2)^2))
+
+  if (nrow(df)) {
+    chosen <- df %>% dplyr::arrange(dplyr::desc(area), dist_center) %>%
+      dplyr::slice(1) %>% dplyr::pull(lbl)
+    mask <- (labm == chosen) * 1
+  }
+}
+
+  stats <- compute_stats(rgb, mask)
+  list(
+    image_size = c(width = W, height = H),
+    params = list(use_lab = use_lab, center_patch = center_patch, tol_quantile = tol_quantile),
+    roi_pixels = stats$roi_pixels,
+    mean_RGB_0_1 = stats$mean_RGB_0_1,
+    mean_HSV_0_1 = stats$mean_HSV_0_1,
+    mean_CMYK_0_1 = stats$mean_CMYK_0_1,
+    roi_mask = mask
+  )
+}
+
+
+```
+
+
+```{r}
+
+res <- extract_centergrown_colors(
+  "/Users/hputnam/MyProjects/Color_Extract/data/IMG_4355.JPG",
+  use_lab = TRUE,
+  center_patch = 21,
+  tol_quantile = 0.90,
+  keep_largest_blob = TRUE,
+  verbose = TRUE
+)
+res$mean_RGB_0_1
+res$mean_HSV_0_1
+res$mean_CMYK_0_1
+
+
+path <- "/Users/hputnam/MyProjects/Color_Extract/data/IMG_4355.JPG"
+
+pdf("/Users/hputnam/MyProjects/Color_Extract/output/roi_overlay.pdf", width = 10, height = 7.5)  # size in inches
+plot(load.image(path), axes = FALSE)
+plot(res$roi_mask, add = TRUE, alpha = 0.35)
+dev.off()
+```
+
